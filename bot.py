@@ -33,7 +33,7 @@ POLYMARKET_API_URL = "https://gamma-api.polymarket.com/markets"
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 MANIFOLD_API_URL = "https://api.manifold.markets/v0/markets"
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8612471675:AAG22kCF2tTsADFW74BtrdjYaxINdFnz7lE")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8540700613:AAG0ICH0j997-OTLdnvA_00wokkFFOChk1g")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "547766473")
 
 SPREAD_THRESHOLD = float(os.environ.get("SPREAD_THRESHOLD", "0.10"))  # 10%
