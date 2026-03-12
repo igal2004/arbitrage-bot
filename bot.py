@@ -489,6 +489,20 @@ async def send_telegram_alert(bot: Bot, opp: dict) -> None:
         except Exception as e2:
             logger.error(f"Fallback alert also failed: {e2}")
 
+    # Send audio alert sound
+    alert_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.mp3")
+    if os.path.exists(alert_sound_path):
+        try:
+            with open(alert_sound_path, "rb") as audio_file:
+                await bot.send_audio(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    audio=audio_file,
+                    title="Arbitrage Alert",
+                    performer="Arbitrage Bot",
+                )
+        except Exception as audio_err:
+            logger.warning(f"Failed to send audio alert: {audio_err}")
+
 
 async def send_status_message(bot: Bot, message: str) -> None:
     """Sends a plain status message to Telegram."""
