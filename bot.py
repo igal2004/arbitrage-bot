@@ -1,8 +1,13 @@
 """
 Arbitrage Bot for Prediction Markets
 
-Scans Polymarket, Kalshi, and Manifold Markets for price discrepancies on the same events.
-Sends Telegram alerts when spreads exceed 10%, including confidence scores and success probability estimates.
+Scans Polymarket vs Kalshi for price discrepancies on the same events.
+Uses Manifold, PredictIt, and Metaculus as confidence indicators (domain-specific).
+
+Domain logic:
+- Manifold: confidence indicator for ALL markets
+- PredictIt: confidence indicator for US POLITICAL markets only
+- Metaculus: confidence indicator for SCIENCE/TECH/GEOPOLITICS/ECONOMICS markets only
 """
 
 import os
@@ -32,9 +37,12 @@ logger = logging.getLogger(__name__)
 POLYMARKET_API_URL = "https://gamma-api.polymarket.com/markets"
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 MANIFOLD_API_URL = "https://api.manifold.markets/v0/markets"
+PREDICTIT_API_URL = "https://www.predictit.org/api/marketdata/all/"
+METACULUS_API_URL = "https://www.metaculus.com/api/posts/"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8540700613:AAG0ICH0j997-OTLdnvA_00wokkFFOChk1g")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "547766473")
+METACULUS_TOKEN = os.environ.get("METACULUS_TOKEN", "47b57944d86da8ca4870eef7be2859aded32a7a4")
 
 SPREAD_THRESHOLD = float(os.environ.get("SPREAD_THRESHOLD", "0.07"))  # 7%
 SIMILARITY_THRESHOLD = int(os.environ.get("SIMILARITY_THRESHOLD", "80"))  # Fuzzy match threshold
@@ -58,6 +66,61 @@ STOP_WORDS = {
     "above", "below", "before", "after", "than", "more", "less", "over",
     "under", "during", "between", "through", "about", "against",
 }
+
+# ─────────────────────────────────────────────
+# Domain Detection
+# ─────────────────────────────────────────────
+
+# Keywords that indicate US political markets (PredictIt domain)
+US_POLITICAL_KEYWORDS = {
+    "trump", "biden", "harris", "democrat", "republican", "senate", "house",
+    "congress", "president", "election", "vote", "ballot", "gop", "dnc",
+    "white house", "oval office", "speaker", "majority", "minority",
+    "midterm", "primary", "caucus", "filibuster", "impeach", "veto",
+    "supreme court", "scotus", "doj", "fbi", "cia", "nsa", "dhs",
+    "secretary", "cabinet", "governor", "mayor", "senator", "representative",
+    "roe", "wade", "abortion", "gun", "second amendment", "border",
+    "immigration", "tariff", "nafta", "usmca", "fed", "powell",
+    "schumer", "mcconnell", "pelosi", "johnson", "desantis", "newsom",
+    "rubio", "vance", "bannon", "maga", "america", "usa", "us ", " us ",
+    "united states", "washington dc", "capitol",
+}
+
+# Keywords that indicate science/tech/geopolitics/economics markets (Metaculus domain)
+METACULUS_DOMAIN_KEYWORDS = {
+    # Science & Tech
+    "ai", "artificial intelligence", "gpt", "openai", "anthropic", "google",
+    "microsoft", "nvidia", "chip", "semiconductor", "quantum", "nuclear",
+    "fusion", "climate", "temperature", "co2", "carbon", "vaccine", "virus",
+    "pandemic", "covid", "cancer", "drug", "fda", "approval", "space",
+    "nasa", "spacex", "mars", "moon", "satellite", "rocket", "launch",
+    "bitcoin", "crypto", "ethereum", "blockchain", "defi",
+    # Geopolitics
+    "ukraine", "russia", "china", "taiwan", "nato", "un ", "united nations",
+    "iran", "north korea", "israel", "gaza", "war", "ceasefire", "peace",
+    "sanctions", "treaty", "invasion", "military", "troops", "missile",
+    "nuclear weapon", "arms", "conflict",
+    # Economics
+    "gdp", "inflation", "recession", "interest rate", "unemployment",
+    "stock market", "s&p", "nasdaq", "dow", "economy", "imf", "world bank",
+    "trade", "export", "import", "deficit", "debt", "budget",
+}
+
+
+def detect_market_domain(question: str) -> dict:
+    """
+    Detects the domain of a market question.
+    Returns dict with 'is_us_political' and 'is_metaculus_domain' flags.
+    """
+    q_lower = question.lower()
+
+    is_us_political = any(kw in q_lower for kw in US_POLITICAL_KEYWORDS)
+    is_metaculus_domain = any(kw in q_lower for kw in METACULUS_DOMAIN_KEYWORDS)
+
+    return {
+        "is_us_political": is_us_political,
+        "is_metaculus_domain": is_metaculus_domain,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -106,7 +169,6 @@ def get_polymarket_data() -> list[dict]:
 def get_kalshi_data() -> list[dict]:
     """Fetches open market data from Kalshi using yes_bid/yes_ask midpoint for pricing."""
     try:
-        # Use min_close_ts to get longer-term markets (1 week from now)
         import time as _time
         min_close_ts = int(_time.time()) + 7 * 24 * 3600
         params = {
@@ -118,25 +180,20 @@ def get_kalshi_data() -> list[dict]:
         response.raise_for_status()
         data = response.json()
         markets = []
-        seen_events: set = set()  # Deduplicate by event ticker
+        seen_events: set = set()
         for market in data.get("markets", []):
             title = market.get("title", "")
             event_ticker = market.get("event_ticker", "")
 
-            # Skip multi-leg parlay markets (contain commas separating multiple legs)
-            # These have patterns like "yes X, no Y" or "yes A, yes B"
-            # But allow titles with commas that are natural language (e.g., "Will X, Y, or Z happen?")
-            # Multi-leg markets always have "yes " or "no " after a comma
+            # Skip multi-leg parlay markets
             import re as _re
             if _re.search(r',\s*(yes|no)\s+', title, _re.IGNORECASE):
                 continue
 
-            # Use midpoint of yes_bid and yes_ask for price
             yes_bid = market.get("yes_bid", 0) or 0
             yes_ask = market.get("yes_ask", 0) or 0
             last_price = market.get("last_price", 0) or 0
 
-            # Prefer last_price if available, else midpoint
             if last_price > 0:
                 price = last_price / 100.0
             elif yes_bid > 0 and yes_ask > 0:
@@ -147,7 +204,6 @@ def get_kalshi_data() -> list[dict]:
                 continue
 
             if 0 < price < 1:
-                # Deduplicate: for multi-outcome events, only take the first market
                 if event_ticker and event_ticker in seen_events:
                     continue
                 if event_ticker:
@@ -172,20 +228,17 @@ def get_kalshi_data() -> list[dict]:
 def get_manifold_data() -> list[dict]:
     """Fetches binary market data from Manifold Markets."""
     try:
-        params = {
-            "limit": MARKETS_PER_PLATFORM,
-        }
+        params = {"limit": MARKETS_PER_PLATFORM}
         response = requests.get(MANIFOLD_API_URL, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
         markets = []
         for market in data:
             prob = market.get("probability")
-            # Only include binary markets with real activity
             if (prob is not None
                     and not market.get("isResolved", False)
                     and market.get("outcomeType") == "BINARY"
-                    and float(market.get("volume", 0)) > 10):  # Minimum volume filter
+                    and float(market.get("volume", 0)) > 10):
                 price = float(prob)
                 if 0 < price < 1:
                     markets.append({
@@ -204,6 +257,79 @@ def get_manifold_data() -> list[dict]:
         return []
 
 
+def get_predictit_data() -> list[dict]:
+    """
+    Fetches binary market data from PredictIt.
+    Only returns single-contract (binary yes/no) markets.
+    PredictIt focuses on US political markets.
+    """
+    try:
+        response = requests.get(PREDICTIT_API_URL, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        markets = []
+        for market in data.get("markets", []):
+            contracts = market.get("contracts", [])
+            # Only include binary markets (single contract = yes/no)
+            if len(contracts) == 1:
+                c = contracts[0]
+                # Use lastTradePrice or bestBuyYesCost as price
+                price = c.get("lastTradePrice") or c.get("bestBuyYesCost")
+                if price and 0 < float(price) < 1:
+                    markets.append({
+                        "question": market.get("name", ""),
+                        "price": float(price),
+                        "volume": 0,  # PredictIt doesn't expose volume easily
+                        "liquidity": 0,
+                        "end_date": market.get("timeStamp"),
+                        "source": "PredictIt",
+                        "url": f"https://www.predictit.org/markets/detail/{market.get('id', '')}",
+                    })
+        logger.info(f"Fetched {len(markets)} binary markets from PredictIt")
+        return markets
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching PredictIt data: {e}")
+        return []
+
+
+def search_metaculus(question: str, max_results: int = 3) -> list[dict]:
+    """
+    Searches Metaculus for questions matching the given question text.
+    Returns a list of matching questions with their titles.
+    Note: With restricted API tier, we can only check if a question EXISTS,
+    not get the community prediction probability.
+    """
+    if not METACULUS_TOKEN:
+        return []
+    try:
+        # Extract key terms for search (first 5 meaningful words)
+        words = [w for w in question.split() if len(w) > 3 and w.lower() not in STOP_WORDS]
+        search_query = " ".join(words[:5])
+        if not search_query:
+            return []
+
+        headers = {"Authorization": f"Token {METACULUS_TOKEN}"}
+        params = {
+            "limit": max_results,
+            "search": search_query,
+            "forecast_type": "binary",
+        }
+        response = requests.get(METACULUS_API_URL, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for post in data.get("results", []):
+            results.append({
+                "title": post.get("title", ""),
+                "status": post.get("question", {}).get("status", ""),
+                "url": f"https://www.metaculus.com/questions/{post.get('id', '')}/",
+            })
+        return results
+    except Exception as e:
+        logger.debug(f"Metaculus search failed: {e}")
+        return []
+
+
 # ─────────────────────────────────────────────
 # Matching Logic
 # ─────────────────────────────────────────────
@@ -212,9 +338,7 @@ def normalize_question(question: str) -> str:
     """Normalizes a question string for fuzzy matching."""
     q = question.lower().strip()
     q = q.rstrip("?").strip()
-    # Remove special characters except spaces and hyphens
     q = re.sub(r"[^\w\s\-]", " ", q)
-    # Normalize whitespace
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
@@ -231,33 +355,24 @@ def questions_are_similar(q1: str, q2: str) -> tuple[bool, int]:
     """
     Determines if two questions are about the same event.
     Returns (is_similar, similarity_score).
-
-    Uses a two-stage approach:
-    1. Keyword overlap check (fast filter)
-    2. Fuzzy string matching (final verification)
     """
-    # Stage 1: Keyword overlap
     kw1 = extract_keywords(q1)
     kw2 = extract_keywords(q2)
 
     if not kw1 or not kw2:
         return False, 0
 
-    # Calculate Jaccard similarity of keywords
     intersection = kw1 & kw2
     union = kw1 | kw2
     jaccard = len(intersection) / len(union) if union else 0
 
-    # Need at least 2 shared keywords OR Jaccard > 0.3
     if len(intersection) < 2 and jaccard < 0.3:
         return False, 0
 
-    # Stage 2: Fuzzy string matching
     n1 = normalize_question(q1)
     n2 = normalize_question(q2)
     fuzzy_score = fuzz.token_set_ratio(n1, n2)
 
-    # Require both keyword overlap AND fuzzy match
     if fuzzy_score >= SIMILARITY_THRESHOLD and len(intersection) >= 2:
         return True, fuzzy_score
 
@@ -275,12 +390,12 @@ def calculate_confidence_score(
     end_date: Optional[str | int | float],
 ) -> int:
     """
-    Calculates a confidence score (1-10) for an arbitrage opportunity.
+    Calculates a base confidence score (1-10) for an arbitrage opportunity.
 
     Factors:
     - Spread size (larger = higher score)
     - Liquidity (higher = higher score)
-    - Time to event (further = higher score, more time to close)
+    - Time to event (further = higher score)
     """
     score = 0.0
 
@@ -307,7 +422,6 @@ def calculate_confidence_score(
     if end_date:
         try:
             if isinstance(end_date, (int, float)):
-                # Manifold uses milliseconds timestamp
                 end_dt = datetime.fromtimestamp(end_date / 1000, tz=timezone.utc)
             else:
                 end_dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
@@ -319,7 +433,7 @@ def calculate_confidence_score(
             elif days_remaining > 1:
                 score += 1.0
         except (ValueError, TypeError):
-            score += 1.5  # Unknown time, give partial credit
+            score += 1.5
 
     return max(1, min(10, round(score)))
 
@@ -327,13 +441,9 @@ def calculate_confidence_score(
 def estimate_success_probability(spread: float, confidence: int) -> float:
     """
     Estimates the probability that this arbitrage spread will close profitably.
-
-    Based on research: 10%+ spreads have ~73% closure rate within 24 hours.
-    Larger spreads and higher confidence increase this estimate.
     """
     base_rate = 0.73
 
-    # Adjust for spread size
     if spread >= 0.30:
         spread_bonus = 0.10
     elif spread >= 0.20:
@@ -341,31 +451,33 @@ def estimate_success_probability(spread: float, confidence: int) -> float:
     else:
         spread_bonus = 0.0
 
-    # Adjust for confidence score
-    confidence_bonus = (confidence - 5) * 0.02  # ±0.02 per point from midpoint
-
+    confidence_bonus = (confidence - 5) * 0.02
     probability = base_rate + spread_bonus + confidence_bonus
     return max(0.50, min(0.95, probability))
 
 
-def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
+def find_arbitrage_opportunities(
+    all_markets: list[dict],
+    predictit_markets: list[dict],
+) -> list[dict]:
     """
     Finds matching markets across platforms and identifies arbitrage opportunities.
     Only alerts on Polymarket vs Kalshi (real money) pairs.
-    Manifold is used as a confidence indicator only.
+
+    Confidence indicators (domain-specific):
+    - Manifold: ALL markets
+    - PredictIt: US political markets only
+    - Metaculus: science/tech/geopolitics/economics markets only
     """
     opportunities = []
     seen_pairs: set = set()
 
-    # Separate markets by source
     polymarket_markets = [m for m in all_markets if m["source"] == "Polymarket"]
     kalshi_markets = [m for m in all_markets if m["source"] == "Kalshi"]
     manifold_markets = [m for m in all_markets if m["source"] == "Manifold"]
 
-    # Only scan Polymarket vs Kalshi pairs (real money)
     for market1 in polymarket_markets:
         for market2 in kalshi_markets:
-            # Check similarity
             is_similar, similarity = questions_are_similar(
                 market1["question"], market2["question"]
             )
@@ -380,13 +492,11 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
             if spread < SPREAD_THRESHOLD:
                 continue
 
-            # Avoid duplicate pairs
             pair_key = tuple(sorted([market1["question"][:40], market2["question"][:40]]))
             if pair_key in seen_pairs:
                 continue
             seen_pairs.add(pair_key)
 
-            # Determine which platform has higher/lower price
             if price1 > price2:
                 high_market, low_market = market1, market2
                 high_price, low_price = price1, price2
@@ -394,32 +504,64 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
                 high_market, low_market = market2, market1
                 high_price, low_price = price2, price1
 
-            # Calculate max price threshold for profitability
-            # Max price to buy on low platform = high_price - min_profit_margin
-            min_profit_margin = 0.02  # 2% minimum profit after fees
+            # Max price threshold for profitability
+            min_profit_margin = 0.02
             max_buy_price = round(high_price - min_profit_margin, 3)
 
-            # Check Manifold for confidence signal
+            # Detect market domain
+            domain = detect_market_domain(market1["question"])
+
+            # ── Manifold confidence (ALL markets) ──
             manifold_confirms = False
             manifold_price = None
             for mf in manifold_markets:
                 is_sim, _ = questions_are_similar(market1["question"], mf["question"])
                 if is_sim:
                     manifold_price = mf["price"]
-                    # Manifold confirms if it agrees with the direction of the low platform
                     if abs(manifold_price - low_price) < abs(manifold_price - high_price):
                         manifold_confirms = True
                     break
 
-            # Calculate scores
+            # ── PredictIt confidence (US political markets only) ──
+            predictit_confirms = False
+            predictit_price = None
+            if domain["is_us_political"]:
+                for pi in predictit_markets:
+                    is_sim, _ = questions_are_similar(market1["question"], pi["question"])
+                    if is_sim:
+                        predictit_price = pi["price"]
+                        if abs(predictit_price - low_price) < abs(predictit_price - high_price):
+                            predictit_confirms = True
+                        break
+
+            # ── Metaculus confidence (science/tech/geopolitics/economics only) ──
+            metaculus_found = False
+            metaculus_url = None
+            if domain["is_metaculus_domain"]:
+                metaculus_results = search_metaculus(market1["question"])
+                if metaculus_results:
+                    # Check if any result is similar enough
+                    for mc_q in metaculus_results:
+                        is_sim, _ = questions_are_similar(market1["question"], mc_q["title"])
+                        if is_sim:
+                            metaculus_found = True
+                            metaculus_url = mc_q["url"]
+                            break
+
+            # Calculate base confidence score
             confidence = calculate_confidence_score(
                 spread,
                 market1.get("liquidity", 0),
                 market2.get("liquidity", 0),
                 market1.get("end_date") or market2.get("end_date"),
             )
-            # Boost confidence if Manifold confirms
+
+            # Boost confidence based on domain-appropriate confirmations
             if manifold_confirms:
+                confidence = min(10, confidence + 1)
+            if predictit_confirms and domain["is_us_political"]:
+                confidence = min(10, confidence + 1)
+            if metaculus_found and domain["is_metaculus_domain"]:
                 confidence = min(10, confidence + 1)
 
             success_prob = estimate_success_probability(spread, confidence)
@@ -441,8 +583,16 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
                 "similarity": similarity,
                 "end_date": market1.get("end_date") or market2.get("end_date"),
                 "max_buy_price": max_buy_price,
+                # Confidence indicators
                 "manifold_confirms": manifold_confirms,
                 "manifold_price": manifold_price,
+                "predictit_confirms": predictit_confirms,
+                "predictit_price": predictit_price,
+                "metaculus_found": metaculus_found,
+                "metaculus_url": metaculus_url,
+                # Domain info
+                "is_us_political": domain["is_us_political"],
+                "is_metaculus_domain": domain["is_metaculus_domain"],
             })
 
     return opportunities
@@ -462,11 +612,20 @@ PLATFORM_HE = {
     "Polymarket": "פולימרקט",
     "Kalshi": "קלשי",
     "Manifold": "מניפולד",
+    "PredictIt": "פרדיקטאיט",
 }
 
 
+def escape_md(text: str) -> str:
+    """Escapes special characters for Telegram MarkdownV2."""
+    special_chars = r'_*[]()~`>#+-=|{}.!'
+    for ch in special_chars:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
 def format_alert(opp: dict) -> str:
-    """Formats an arbitrage opportunity as a Telegram message."""
+    """Formats an arbitrage opportunity as a Telegram MarkdownV2 message."""
     confidence_stars = "⭐" * opp["confidence"] + "☆" * (10 - opp["confidence"])
     success_pct = opp["success_probability"] * 100
 
@@ -485,37 +644,70 @@ def format_alert(opp: dict) -> str:
         except (ValueError, TypeError):
             pass
 
-    # Manifold confirmation line
-    manifold_line = ""
+    # Build confidence indicators section
+    confidence_lines = []
+
+    # Manifold (always shown if available)
     if opp.get("manifold_price") is not None:
         mf_emoji = "✅" if opp.get("manifold_confirms") else "⚠️"
-        mf_status = "מאשר את הכיוון" if opp.get("manifold_confirms") else "לא מאשר"
-        manifold_line = f"  • מניפולד: {format_price(opp['manifold_price'])} {mf_emoji} _{mf_status}_\n"
+        mf_status = "מאשר" if opp.get("manifold_confirms") else "לא מאשר"
+        confidence_lines.append(
+            f"  • מניפולד: {format_price(opp['manifold_price'])} {mf_emoji} _{mf_status}_"
+        )
+
+    # PredictIt (US political only)
+    if opp.get("is_us_political") and opp.get("predictit_price") is not None:
+        pi_emoji = "✅" if opp.get("predictit_confirms") else "⚠️"
+        pi_status = "מאשר" if opp.get("predictit_confirms") else "לא מאשר"
+        confidence_lines.append(
+            f"  • פרדיקטאיט: {format_price(opp['predictit_price'])} {pi_emoji} _{pi_status}_"
+        )
+    elif opp.get("is_us_political") and opp.get("predictit_price") is None:
+        confidence_lines.append("  • פרדיקטאיט: לא נמצא שוק מתאים")
+
+    # Metaculus (science/tech/geopolitics/economics only)
+    if opp.get("is_metaculus_domain"):
+        if opp.get("metaculus_found"):
+            mc_url = opp.get("metaculus_url", "")
+            confidence_lines.append(
+                f"  • מטקולוס: ✅ _שאלה קיימת_ \\([קישור]({mc_url})\\)"
+            )
+        else:
+            confidence_lines.append("  • מטקולוס: לא נמצאה שאלה מתאימה")
+
+    confidence_section = "\n".join(confidence_lines) if confidence_lines else "  • אין מדדי ביטחון נוספים"
 
     # Max buy price line
     max_price = opp.get("max_buy_price", 0)
-    max_price_line = f"  • 🛑 *מחיר מקסימלי לקנייה:* {format_price(max_price)} \(מעל זה — לא כדאי\)\n"
+    max_price_line = f"  • 🛑 *מחיר מקסימלי לקנייה:* {format_price(max_price)} \\(מעל זה — לא כדאי\\)"
+
+    # Escape event name for MarkdownV2
+    event_escaped = escape_md(opp['event'][:100])
+
+    # Build the message - handle end_date_str to avoid triple newlines
+    date_section = f"{end_date_str}\n" if end_date_str else ""
 
     message = (
         f"🚨 *הזדמנות ארביטראז'* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *אירוע:* {opp['event'][:100]}\n"
-        f"{end_date_str}\n\n"
+        f"📌 *אירוע:* {event_escaped}\n"
+        f"{date_section}\n"
         f"💰 *פערי מחיר:*\n"
-        f"  • {high_he}: {format_price(opp['high_price'])} _\(מחיר גבוה — מכור כן / קנה לא\)_\n"
-        f"  • {low_he}: {format_price(opp['low_price'])} _\(מחיר נמוך — קנה כן כאן\)_\n"
-        f"{manifold_line}"
-        f"{max_price_line}\n"
+        f"  • {high_he}: {format_price(opp['high_price'])} _\\(מחיר גבוה — מכור כן / קנה לא\\)_\n"
+        f"  • {low_he}: {format_price(opp['low_price'])} _\\(מחיר נמוך — קנה כן כאן\\)_\n"
+        f"{max_price_line}\n\n"
+        f"🔍 *מדדי ביטחון:*\n"
+        f"{confidence_section}\n\n"
         f"📊 *ניתוח:*\n"
         f"  • פער: *{opp['spread_pct']:.1f}%*\n"
         f"  • פוטנציאל רווח: *{opp['roi_potential']:.1f}%*\n"
         f"  • הסתברות הצלחה: *{success_pct:.0f}%*\n"
-        f"  • ביטחון: {confidence_stars} \({opp['confidence']}/10\)\n\n"
+        f"  • ביטחון: {confidence_stars} \\({opp['confidence']}/10\\)\n\n"
         f"🔗 *קישורים:*\n"
         f"  • [{high_he}]({opp['high_url']})\n"
         f"  • [{low_he}]({opp['low_url']})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _התראה בלבד\. בדוק מחיר עדכני לפני ביצוע\._"
+        f"⚠️ _התראה בלבד\\. בדוק מחיר עדכני לפני ביצוע\\._"
     )
     return message
 
@@ -536,7 +728,7 @@ async def send_telegram_alert(bot: Bot, opp: dict) -> None:
         # Try plain text fallback
         try:
             plain = (
-                f"ARBITRAGE OPPORTUNITY: {opp['event'][:80]}\n"
+                f"ARBITRAGE: {opp['event'][:80]}\n"
                 f"{opp['high_platform']}: {format_price(opp['high_price'])} vs "
                 f"{opp['low_platform']}: {format_price(opp['low_price'])}\n"
                 f"Spread: {opp['spread_pct']:.1f}% | Confidence: {opp['confidence']}/10 | "
@@ -546,7 +738,7 @@ async def send_telegram_alert(bot: Bot, opp: dict) -> None:
         except Exception as e2:
             logger.error(f"Fallback alert also failed: {e2}")
 
-    # Send audio alert sound
+    # Send audio alert
     alert_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.mp3")
     if os.path.exists(alert_sound_path):
         try:
@@ -584,15 +776,17 @@ async def run_scan(bot) -> None:
     polymarket = get_polymarket_data()
     kalshi = get_kalshi_data()
     manifold = get_manifold_data()
+    predictit = get_predictit_data()
 
     all_markets = polymarket + kalshi + manifold
     logger.info(
         f"Total markets loaded: {len(all_markets)} "
-        f"({len(polymarket)} Polymarket, {len(kalshi)} Kalshi, {len(manifold)} Manifold)"
+        f"({len(polymarket)} Polymarket, {len(kalshi)} Kalshi, "
+        f"{len(manifold)} Manifold) + {len(predictit)} PredictIt"
     )
 
     # Find opportunities
-    opportunities = find_arbitrage_opportunities(all_markets)
+    opportunities = find_arbitrage_opportunities(all_markets, predictit)
     logger.info(
         f"Found {len(opportunities)} arbitrage opportunities "
         f"(spread >= {SPREAD_THRESHOLD * 100:.0f}%)"
@@ -606,7 +800,7 @@ async def run_scan(bot) -> None:
             await send_telegram_alert(bot, opp)
             alerted_opportunities.add(opp_key)
             new_alerts += 1
-            await asyncio.sleep(1)  # Rate limiting
+            await asyncio.sleep(1)
 
     if new_alerts == 0 and len(opportunities) > 0:
         logger.info("All opportunities already alerted")
@@ -616,7 +810,6 @@ async def run_scan(bot) -> None:
     _last_scan_count += 1
     _last_opportunities_found = len(opportunities)
 
-    # Clear old alerts periodically
     if len(alerted_opportunities) > 1000:
         alerted_opportunities.clear()
         logger.info("Cleared alerted opportunities cache")
@@ -628,7 +821,6 @@ async def run_scan(bot) -> None:
 
 async def cmd_a_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Responds to /a_ping — confirms the bot is alive."""
-    from datetime import datetime
     now = datetime.now().strftime("%H:%M:%S")
     await update.message.reply_text(
         f"🟢 *בוט ארביטראז' פעיל!*\n\nשעה: {now}",
@@ -645,7 +837,8 @@ async def cmd_a_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⚡ הזדמנויות בסריקה אחרונה: {_last_opportunities_found}\n"
         f"🎯 סף פרש: {SPREAD_THRESHOLD * 100:.0f}%\n"
         f"⏱ סריקה כל: {SCAN_INTERVAL_SECONDS // 60} דקות\n"
-        f"🌐 מקורות: Polymarket, Kalshi, Manifold",
+        f"🌐 מקורות: Polymarket, Kalshi\n"
+        f"🔍 מדדי ביטחון: Manifold, PredictIt \\(פוליטי\\), Metaculus \\(מדע/טק/גאו\\)",
         parse_mode="Markdown"
     )
 
@@ -653,7 +846,6 @@ async def cmd_a_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_a_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Responds to /a_report — triggers an immediate scan."""
     await update.message.reply_text("🔍 מתחיל סריקה מידית... (כמה דקות)")
-    # Run scan in background
     ptb_app = ctx.application
     ptb_app.create_task(run_scan(ptb_app.bot))
 
@@ -688,13 +880,13 @@ async def _daily_backup_loop(bot: Bot) -> None:
     await asyncio.sleep(3600)  # Wait 1 hour before first backup
     while True:
         await send_daily_backup(bot)
-        await asyncio.sleep(86400)  # 24 hours
+        await asyncio.sleep(86400)
 
 
 async def _scan_loop(bot) -> None:
     """Background scan loop that runs every SCAN_INTERVAL_SECONDS."""
     global _last_scan_count
-    await asyncio.sleep(10)  # Short delay before first scan
+    await asyncio.sleep(10)
     while True:
         try:
             _last_scan_count += 1
@@ -708,18 +900,19 @@ async def _scan_loop(bot) -> None:
 
 async def main() -> None:
     """Main async function to run the arbitrage bot with PTB command handlers."""
-    # Build PTB application
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register /a_ command handlers
     app.add_handler(CommandHandler("a_ping",   cmd_a_ping))
     app.add_handler(CommandHandler("a_status", cmd_a_status))
     app.add_handler(CommandHandler("a_report", cmd_a_report))
 
-    # Send startup message
     startup_msg = (
         f"🤖 בוט ארביטראז' נדלק!\n"
-        f"🌐 סריקה: Polymarket vs Kalshi \u05d1לבד \(עם Manifold כמדד ביטחון\)\n"
+        f"🌐 סריקה: Polymarket vs Kalshi בלבד\n"
+        f"🔍 מדדי ביטחון:\n"
+        f"  • מניפולד — כל השווקים\n"
+        f"  • פרדיקטאיט — שווקים פוליטיים אמריקאים\n"
+        f"  • מטקולוס — מדע/טק/גיאופוליטיקה/כלכלה\n"
         f"🎯 סף Spread: {SPREAD_THRESHOLD * 100:.0f}%\n"
         f"⏱ סריקה כל: {SCAN_INTERVAL_SECONDS // 60} דקות\n"
         f"💾 גיבוי יומי אוטומטי\n"
@@ -731,12 +924,10 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"Failed to send startup message: {e}")
 
-    # Initialize PTB and start polling
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    # Run the scan loop and daily backup in the background
     asyncio.ensure_future(_daily_backup_loop(app.bot))
     await _scan_loop(app.bot)
 
