@@ -16,8 +16,9 @@ from typing import Optional
 
 import requests
 from fuzzywuzzy import fuzz
-from telegram import Bot
+from telegram import Bot, Update
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- Logging ---
 logging.basicConfig(
@@ -42,6 +43,11 @@ MARKETS_PER_PLATFORM = int(os.environ.get("MARKETS_PER_PLATFORM", "200"))
 
 # Track already-alerted opportunities to avoid spam
 alerted_opportunities: set = set()
+
+# Track last scan stats for status command
+_last_scan_time: str = "טרם בוצעה"
+_last_scan_count: int = 0
+_last_opportunities_found: int = 0
 
 # Common stop words to remove before matching
 STOP_WORDS = {
@@ -516,9 +522,11 @@ async def send_status_message(bot: Bot, message: str) -> None:
 # Main Loop
 # ─────────────────────────────────────────────
 
-async def run_scan(bot: Bot) -> None:
+async def run_scan(bot) -> None:
     """Runs a single scan cycle across all platforms."""
+    global _last_scan_time, _last_scan_count, _last_opportunities_found
     scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    _last_scan_time = scan_time
     logger.info(f"Starting scan at {scan_time}")
 
     # Fetch data from all platforms
@@ -554,39 +562,97 @@ async def run_scan(bot: Bot) -> None:
     elif new_alerts == 0:
         logger.info("No new arbitrage opportunities found this scan")
 
+    _last_scan_count += 1
+    _last_opportunities_found = len(opportunities)
+
     # Clear old alerts periodically
     if len(alerted_opportunities) > 1000:
         alerted_opportunities.clear()
         logger.info("Cleared alerted opportunities cache")
 
 
-async def main() -> None:
-    """Main async function to run the arbitrage bot."""
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# ─────────────────────────────────────────────
+# Command Handlers
+# ─────────────────────────────────────────────
 
+async def cmd_a_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responds to /a_ping — confirms the bot is alive."""
+    from datetime import datetime
+    now = datetime.now().strftime("%H:%M:%S")
+    await update.message.reply_text(
+        f"🟢 *בוט ארביטראז' פעיל!*\n\nשעה: {now}",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_a_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responds to /a_status — shows bot status and last scan info."""
+    await update.message.reply_text(
+        f"🤖 *סטטוס בוט ארביטראז'*\n\n"
+        f"🔍 סריקה אחרונה: {_last_scan_time}\n"
+        f"📊 סריקות שבוצעו: {_last_scan_count}\n"
+        f"⚡ הזדמנויות בסריקה אחרונה: {_last_opportunities_found}\n"
+        f"🎯 סף פרש: {SPREAD_THRESHOLD * 100:.0f}%\n"
+        f"⏱ סריקה כל: {SCAN_INTERVAL_SECONDS // 60} דקות\n"
+        f"🌐 מקורות: Polymarket, Kalshi, Manifold",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_a_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responds to /a_report — triggers an immediate scan."""
+    await update.message.reply_text("🔍 מתחיל סריקה מידית... (כמה דקות)")
+    # Run scan in background
+    ptb_app = ctx.application
+    ptb_app.create_task(run_scan(ptb_app.bot))
+
+
+async def _scan_loop(bot) -> None:
+    """Background scan loop that runs every SCAN_INTERVAL_SECONDS."""
+    global _last_scan_count
+    await asyncio.sleep(10)  # Short delay before first scan
+    while True:
+        try:
+            _last_scan_count += 1
+            logger.info(f"=== Scan #{_last_scan_count} ===")
+            await run_scan(bot)
+        except Exception as e:
+            logger.error(f"Error during scan: {e}", exc_info=True)
+        logger.info(f"Sleeping {SCAN_INTERVAL_SECONDS // 60} minutes until next scan...")
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+async def main() -> None:
+    """Main async function to run the arbitrage bot with PTB command handlers."""
+    # Build PTB application
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Register /a_ command handlers
+    app.add_handler(CommandHandler("a_ping",   cmd_a_ping))
+    app.add_handler(CommandHandler("a_status", cmd_a_status))
+    app.add_handler(CommandHandler("a_report", cmd_a_report))
+
+    # Send startup message
     startup_msg = (
         f"🤖 Arbitrage Bot Started\n"
         f"Scanning: Polymarket, Kalshi, Manifold\n"
         f"Spread threshold: {SPREAD_THRESHOLD * 100:.0f}%\n"
         f"Scan interval: {SCAN_INTERVAL_SECONDS // 60} minutes\n"
+        f"Commands: /a_ping | /a_status | /a_report\n"
         f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=startup_msg)
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=startup_msg)
     except Exception as e:
         logger.error(f"Failed to send startup message: {e}")
 
-    scan_count = 0
-    while True:
-        try:
-            scan_count += 1
-            logger.info(f"=== Scan #{scan_count} ===")
-            await run_scan(bot)
-        except Exception as e:
-            logger.error(f"Error during scan: {e}", exc_info=True)
+    # Initialize PTB and start polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-        logger.info(f"Sleeping {SCAN_INTERVAL_SECONDS // 60} minutes until next scan...")
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+    # Run the scan loop in the background
+    await _scan_loop(app.bot)
 
 
 if __name__ == "__main__":
