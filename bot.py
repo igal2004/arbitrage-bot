@@ -349,19 +349,22 @@ def estimate_success_probability(spread: float, confidence: int) -> float:
 
 
 def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
-    """Finds matching markets across platforms and identifies arbitrage opportunities."""
+    """
+    Finds matching markets across platforms and identifies arbitrage opportunities.
+    Only alerts on Polymarket vs Kalshi (real money) pairs.
+    Manifold is used as a confidence indicator only.
+    """
     opportunities = []
     seen_pairs: set = set()
 
-    for i in range(len(all_markets)):
-        for j in range(i + 1, len(all_markets)):
-            market1 = all_markets[i]
-            market2 = all_markets[j]
+    # Separate markets by source
+    polymarket_markets = [m for m in all_markets if m["source"] == "Polymarket"]
+    kalshi_markets = [m for m in all_markets if m["source"] == "Kalshi"]
+    manifold_markets = [m for m in all_markets if m["source"] == "Manifold"]
 
-            # Skip same-platform comparisons
-            if market1["source"] == market2["source"]:
-                continue
-
+    # Only scan Polymarket vs Kalshi pairs (real money)
+    for market1 in polymarket_markets:
+        for market2 in kalshi_markets:
             # Check similarity
             is_similar, similarity = questions_are_similar(
                 market1["question"], market2["question"]
@@ -391,6 +394,23 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
                 high_market, low_market = market2, market1
                 high_price, low_price = price2, price1
 
+            # Calculate max price threshold for profitability
+            # Max price to buy on low platform = high_price - min_profit_margin
+            min_profit_margin = 0.02  # 2% minimum profit after fees
+            max_buy_price = round(high_price - min_profit_margin, 3)
+
+            # Check Manifold for confidence signal
+            manifold_confirms = False
+            manifold_price = None
+            for mf in manifold_markets:
+                is_sim, _ = questions_are_similar(market1["question"], mf["question"])
+                if is_sim:
+                    manifold_price = mf["price"]
+                    # Manifold confirms if it agrees with the direction of the low platform
+                    if abs(manifold_price - low_price) < abs(manifold_price - high_price):
+                        manifold_confirms = True
+                    break
+
             # Calculate scores
             confidence = calculate_confidence_score(
                 spread,
@@ -398,6 +418,10 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
                 market2.get("liquidity", 0),
                 market1.get("end_date") or market2.get("end_date"),
             )
+            # Boost confidence if Manifold confirms
+            if manifold_confirms:
+                confidence = min(10, confidence + 1)
+
             success_prob = estimate_success_probability(spread, confidence)
             roi_potential = spread / low_price * 100 if low_price > 0 else 0
 
@@ -416,6 +440,9 @@ def find_arbitrage_opportunities(all_markets: list[dict]) -> list[dict]:
                 "success_probability": success_prob,
                 "similarity": similarity,
                 "end_date": market1.get("end_date") or market2.get("end_date"),
+                "max_buy_price": max_buy_price,
+                "manifold_confirms": manifold_confirms,
+                "manifold_price": manifold_price,
             })
 
     return opportunities
@@ -447,24 +474,37 @@ def format_alert(opp: dict) -> str:
         except (ValueError, TypeError):
             pass
 
+    # Manifold confirmation line
+    manifold_line = ""
+    if opp.get("manifold_price") is not None:
+        mf_emoji = "✅" if opp.get("manifold_confirms") else "⚠️"
+        mf_status = "מאשר את הכיוון" if opp.get("manifold_confirms") else "לא מאשר"
+        manifold_line = f"  • Manifold: {format_price(opp['manifold_price'])} {mf_emoji} _{mf_status}_\n"
+
+    # Max buy price line
+    max_price = opp.get("max_buy_price", 0)
+    max_price_line = f"  • 🛑 *מחיר מקסימלי לקנייה:* {format_price(max_price)} \(מעל זה — לא כדאי\)\n"
+
     message = (
-        f"🚨 *ARBITRAGE OPPORTUNITY DETECTED* 🚨\n"
+        f"🚨 *הזדמנות ארביטראז' \- Polymarket vs Kalshi* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *Event:* {opp['event'][:100]}\n"
+        f"📌 *אירוע:* {opp['event'][:100]}\n"
         f"{end_date_str}\n\n"
-        f"💰 *Price Discrepancy:*\n"
-        f"  • {opp['high_platform']}: {format_price(opp['high_price'])} _(SELL YES / BUY NO)_\n"
-        f"  • {opp['low_platform']}: {format_price(opp['low_price'])} _(BUY YES)_\n\n"
-        f"📊 *Analysis:*\n"
+        f"💰 *פערי מחיר:*\n"
+        f"  • {opp['high_platform']}: {format_price(opp['high_price'])} _\(מחיר גבוה — מכור YES / קנה NO\)_\n"
+        f"  • {opp['low_platform']}: {format_price(opp['low_price'])} _\(מחיר נמוך — קנה YES כאן\)_\n"
+        f"{manifold_line}"
+        f"{max_price_line}\n"
+        f"📊 *ניתוח:*\n"
         f"  • Spread: *{opp['spread_pct']:.1f}%*\n"
-        f"  • ROI Potential: *{opp['roi_potential']:.1f}%*\n"
-        f"  • Success Probability: *{success_pct:.0f}%*\n"
-        f"  • Confidence: {confidence_stars} ({opp['confidence']}/10)\n\n"
-        f"🔗 *Links:*\n"
+        f"  • פוטנציאל ROI: *{opp['roi_potential']:.1f}%*\n"
+        f"  • הסתברות הצלחה: *{success_pct:.0f}%*\n"
+        f"  • ביטחון: {confidence_stars} \({opp['confidence']}/10\)\n\n"
+        f"🔗 *קישורים:*\n"
         f"  • [{opp['high_platform']}]({opp['high_url']})\n"
         f"  • [{opp['low_platform']}]({opp['low_url']})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _Alert\\-only mode\\. No automatic trading\\._"
+        f"⚠️ _התראה בלבד\. בצע ידנית לאחר בדיקת מחיר עדכני\._"
     )
     return message
 
@@ -607,6 +647,39 @@ async def cmd_a_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ptb_app.create_task(run_scan(ptb_app.bot))
 
 
+async def send_daily_backup(bot: Bot) -> None:
+    """Sends a silent daily status backup to Telegram for recovery purposes."""
+    try:
+        backup_data = {
+            "_arb_backup": True,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "scans_completed": _last_scan_count,
+            "last_scan_time": _last_scan_time,
+            "last_opportunities_found": _last_opportunities_found,
+            "spread_threshold": SPREAD_THRESHOLD,
+            "alerted_count": len(alerted_opportunities),
+        }
+        import json as _json
+        backup_text = f"💾 *Arbitrage Bot Daily Backup*\n`{_json.dumps(backup_data, ensure_ascii=False)}`"
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=backup_text,
+            parse_mode="Markdown",
+            disable_notification=True,
+        )
+        logger.info("Daily backup sent to Telegram")
+    except Exception as e:
+        logger.warning(f"Failed to send daily backup: {e}")
+
+
+async def _daily_backup_loop(bot: Bot) -> None:
+    """Sends a daily backup every 24 hours."""
+    await asyncio.sleep(3600)  # Wait 1 hour before first backup
+    while True:
+        await send_daily_backup(bot)
+        await asyncio.sleep(86400)  # 24 hours
+
+
 async def _scan_loop(bot) -> None:
     """Background scan loop that runs every SCAN_INTERVAL_SECONDS."""
     global _last_scan_count
@@ -634,12 +707,13 @@ async def main() -> None:
 
     # Send startup message
     startup_msg = (
-        f"🤖 Arbitrage Bot Started\n"
-        f"Scanning: Polymarket, Kalshi, Manifold\n"
-        f"Spread threshold: {SPREAD_THRESHOLD * 100:.0f}%\n"
-        f"Scan interval: {SCAN_INTERVAL_SECONDS // 60} minutes\n"
-        f"Commands: /a_ping | /a_status | /a_report\n"
-        f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"🤖 בוט ארביטראז' נדלק!\n"
+        f"🌐 סריקה: Polymarket vs Kalshi \u05d1לבד \(עם Manifold כמדד ביטחון\)\n"
+        f"🎯 סף Spread: {SPREAD_THRESHOLD * 100:.0f}%\n"
+        f"⏱ סריקה כל: {SCAN_INTERVAL_SECONDS // 60} דקות\n"
+        f"💾 גיבוי יומי אוטומטי\n"
+        f"💬 פקודות: /a_ping | /a_status | /a_report\n"
+        f"⏰ התחלת פעילה: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     try:
         await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=startup_msg)
@@ -651,7 +725,8 @@ async def main() -> None:
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    # Run the scan loop in the background
+    # Run the scan loop and daily backup in the background
+    asyncio.ensure_future(_daily_backup_loop(app.bot))
     await _scan_loop(app.bot)
 
 
