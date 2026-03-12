@@ -457,10 +457,21 @@ def format_price(price: float) -> str:
     return f"{price * 100:.1f}¢"
 
 
+# Hebrew platform name mapping
+PLATFORM_HE = {
+    "Polymarket": "פולימרקט",
+    "Kalshi": "קלשי",
+    "Manifold": "מניפולד",
+}
+
+
 def format_alert(opp: dict) -> str:
     """Formats an arbitrage opportunity as a Telegram message."""
     confidence_stars = "⭐" * opp["confidence"] + "☆" * (10 - opp["confidence"])
     success_pct = opp["success_probability"] * 100
+
+    high_he = PLATFORM_HE.get(opp["high_platform"], opp["high_platform"])
+    low_he = PLATFORM_HE.get(opp["low_platform"], opp["low_platform"])
 
     end_date_str = ""
     if opp.get("end_date"):
@@ -470,7 +481,7 @@ def format_alert(opp: dict) -> str:
                 end_dt = datetime.fromtimestamp(ed / 1000, tz=timezone.utc)
             else:
                 end_dt = datetime.fromisoformat(str(ed).replace("Z", "+00:00"))
-            end_date_str = f"\n📅 *Closes:* {end_dt.strftime('%b %d, %Y')}"
+            end_date_str = f"\n📅 *סגירה:* {end_dt.strftime('%d/%m/%Y')}"
         except (ValueError, TypeError):
             pass
 
@@ -479,32 +490,32 @@ def format_alert(opp: dict) -> str:
     if opp.get("manifold_price") is not None:
         mf_emoji = "✅" if opp.get("manifold_confirms") else "⚠️"
         mf_status = "מאשר את הכיוון" if opp.get("manifold_confirms") else "לא מאשר"
-        manifold_line = f"  • Manifold: {format_price(opp['manifold_price'])} {mf_emoji} _{mf_status}_\n"
+        manifold_line = f"  • מניפולד: {format_price(opp['manifold_price'])} {mf_emoji} _{mf_status}_\n"
 
     # Max buy price line
     max_price = opp.get("max_buy_price", 0)
     max_price_line = f"  • 🛑 *מחיר מקסימלי לקנייה:* {format_price(max_price)} \(מעל זה — לא כדאי\)\n"
 
     message = (
-        f"🚨 *הזדמנות ארביטראז' \- Polymarket vs Kalshi* 🚨\n"
+        f"🚨 *הזדמנות ארביטראז'* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *אירוע:* {opp['event'][:100]}\n"
         f"{end_date_str}\n\n"
         f"💰 *פערי מחיר:*\n"
-        f"  • {opp['high_platform']}: {format_price(opp['high_price'])} _\(מחיר גבוה — מכור YES / קנה NO\)_\n"
-        f"  • {opp['low_platform']}: {format_price(opp['low_price'])} _\(מחיר נמוך — קנה YES כאן\)_\n"
+        f"  • {high_he}: {format_price(opp['high_price'])} _\(מחיר גבוה — מכור כן / קנה לא\)_\n"
+        f"  • {low_he}: {format_price(opp['low_price'])} _\(מחיר נמוך — קנה כן כאן\)_\n"
         f"{manifold_line}"
         f"{max_price_line}\n"
         f"📊 *ניתוח:*\n"
-        f"  • Spread: *{opp['spread_pct']:.1f}%*\n"
-        f"  • פוטנציאל ROI: *{opp['roi_potential']:.1f}%*\n"
+        f"  • פער: *{opp['spread_pct']:.1f}%*\n"
+        f"  • פוטנציאל רווח: *{opp['roi_potential']:.1f}%*\n"
         f"  • הסתברות הצלחה: *{success_pct:.0f}%*\n"
         f"  • ביטחון: {confidence_stars} \({opp['confidence']}/10\)\n\n"
         f"🔗 *קישורים:*\n"
-        f"  • [{opp['high_platform']}]({opp['high_url']})\n"
-        f"  • [{opp['low_platform']}]({opp['low_url']})\n"
+        f"  • [{high_he}]({opp['high_url']})\n"
+        f"  • [{low_he}]({opp['low_url']})\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _התראה בלבד\. בצע ידנית לאחר בדיקת מחיר עדכני\._"
+        f"⚠️ _התראה בלבד\. בדוק מחיר עדכני לפני ביצוע\._"
     )
     return message
 
