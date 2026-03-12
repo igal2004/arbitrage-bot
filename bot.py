@@ -36,7 +36,7 @@ MANIFOLD_API_URL = "https://api.manifold.markets/v0/markets"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8540700613:AAG0ICH0j997-OTLdnvA_00wokkFFOChk1g")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "547766473")
 
-SPREAD_THRESHOLD = float(os.environ.get("SPREAD_THRESHOLD", "0.10"))  # 10%
+SPREAD_THRESHOLD = float(os.environ.get("SPREAD_THRESHOLD", "0.07"))  # 7%
 SIMILARITY_THRESHOLD = int(os.environ.get("SIMILARITY_THRESHOLD", "80"))  # Fuzzy match threshold
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "900"))  # 15 minutes
 MARKETS_PER_PLATFORM = int(os.environ.get("MARKETS_PER_PLATFORM", "200"))
