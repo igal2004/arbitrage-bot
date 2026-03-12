@@ -190,16 +190,40 @@ def get_kalshi_data() -> list[dict]:
             if _re.search(r',\s*(yes|no)\s+', title, _re.IGNORECASE):
                 continue
 
-            yes_bid = market.get("yes_bid", 0) or 0
-            yes_ask = market.get("yes_ask", 0) or 0
-            last_price = market.get("last_price", 0) or 0
+            # Kalshi API uses _dollars suffix (string values, already in dollar format)
+            # Fallback to old integer fields (cents) for backward compatibility
+            def _parse_price(val):
+                """Parse price from string or int, returns float 0-1 or None."""
+                if val is None:
+                    return None
+                try:
+                    f = float(val)
+                    # If value > 1, it's in cents (old API format)
+                    if f > 1:
+                        f = f / 100.0
+                    return f if 0 < f < 1 else None
+                except (ValueError, TypeError):
+                    return None
 
-            if last_price > 0:
-                price = last_price / 100.0
-            elif yes_bid > 0 and yes_ask > 0:
-                price = (yes_bid + yes_ask) / 2 / 100.0
-            elif yes_ask > 0:
-                price = yes_ask / 100.0
+            last_price = (
+                _parse_price(market.get("last_price_dollars"))
+                or _parse_price(market.get("last_price"))
+            )
+            yes_bid = (
+                _parse_price(market.get("yes_bid_dollars"))
+                or _parse_price(market.get("yes_bid"))
+            )
+            yes_ask = (
+                _parse_price(market.get("yes_ask_dollars"))
+                or _parse_price(market.get("yes_ask"))
+            )
+
+            if last_price:
+                price = last_price
+            elif yes_bid and yes_ask:
+                price = (yes_bid + yes_ask) / 2
+            elif yes_ask:
+                price = yes_ask
             else:
                 continue
 
@@ -209,11 +233,21 @@ def get_kalshi_data() -> list[dict]:
                 if event_ticker:
                     seen_events.add(event_ticker)
 
+                # Parse volume and liquidity (new API uses _fp and _dollars suffixes)
+                try:
+                    vol = float(market.get("volume_24h_fp") or market.get("volume_24h") or 0)
+                except (TypeError, ValueError):
+                    vol = 0
+                try:
+                    liq = float(market.get("liquidity_dollars") or market.get("liquidity") or 0)
+                except (TypeError, ValueError):
+                    liq = 0
+
                 markets.append({
                     "question": title,
                     "price": price,
-                    "volume": market.get("volume_24h", 0) or 0,
-                    "liquidity": market.get("liquidity", 0) or 0,
+                    "volume": vol,
+                    "liquidity": liq,
                     "end_date": market.get("close_time"),
                     "source": "Kalshi",
                     "url": f"https://kalshi.com/markets/{market.get('ticker', '')}",
