@@ -877,6 +877,47 @@ async def cmd_a_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_a_audit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """הרצת בקרה מעגלית ידנית — /a_audit"""
+    await update.message.reply_text(
+        "🔍 *מריץ בדיקת בקרה מעגלית — ארביטראז'...* (זה עשוי לקחת 10 שניות)",
+        parse_mode="Markdown"
+    )
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["python3.11", "audit_bot.py", "--silent"],
+            capture_output=True, text=True, timeout=60,
+            cwd="/app"
+        )
+        output = result.stdout
+        passed = output.count("[PASS]")
+        failed_count = output.count("[FAIL]")
+        warn_count = output.count("[WARN]")
+        total = passed + failed_count + warn_count
+        status_emoji = "✅" if failed_count == 0 else "❌"
+        now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+        lines = [
+            f"{status_emoji} *בקרה מעגלית ידנית — ארביטראז' — {now_str}*\n",
+            f"📊 עברו: *{passed}/{total}* | ❌ כשלים: *{failed_count}* | ⚠️ אזהרות: *{warn_count}*\n",
+        ]
+        if failed_count > 0:
+            fail_lines = [l for l in output.split("\n") if "[FAIL]" in l]
+            lines.append("*🚨 כשלים:*")
+            for fl in fail_lines:
+                lines.append(f"  {fl.strip()}")
+        if warn_count > 0:
+            warn_lines = [l for l in output.split("\n") if "[WARN]" in l]
+            lines.append("\n*⚠️ אזהרות:*")
+            for wl in warn_lines:
+                lines.append(f"  {wl.strip()}")
+        if failed_count == 0 and warn_count == 0:
+            lines.append("🎉 *כל התכונות פועלות כמצופה!*")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ שגיאה בבקרה: {e}")
+
+
 async def cmd_a_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Responds to /a_report — triggers an immediate scan."""
     await update.message.reply_text("🔍 מתחיל סריקה מידית... (כמה דקות)")
@@ -939,6 +980,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("a_ping",   cmd_a_ping))
     app.add_handler(CommandHandler("a_status", cmd_a_status))
     app.add_handler(CommandHandler("a_report", cmd_a_report))
+    app.add_handler(CommandHandler("a_audit",  cmd_a_audit))
 
     startup_msg = (
         f"🤖 בוט ארביטראז' נדלק!\n"
@@ -963,6 +1005,74 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
 
     asyncio.ensure_future(_daily_backup_loop(app.bot))
+
+    # ─── Circular Audit Loop (DAILY at 08:00 Israel time) ──────────────────
+    async def _circular_audit_loop():
+        """מנגנון בקרה מעגלי — בודק שכל תכונה שסוכמה מיושמת. כל יום 08:00."""
+        import datetime as _dt
+        import pytz as _pytz
+        ISRAEL_TZ = _pytz.timezone("Asia/Jerusalem")
+        await asyncio.sleep(180)  # First check after 3 minutes
+        _last_failed_count = -1
+        first_run = True
+        while True:
+            try:
+                now = _dt.datetime.now(ISRAEL_TZ)
+                if not first_run:
+                    next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                    if now.hour >= 8:
+                        next_run += _dt.timedelta(days=1)
+                    wait_secs = (next_run - now).total_seconds()
+                    logger.info(f"בקרה מעגלית (ארביטראז'): בדיקה הבאה ב-{next_run.strftime('%d/%m %H:%M')}")
+                    await asyncio.sleep(wait_secs)
+                first_run = False
+                now = _dt.datetime.now(ISRAEL_TZ)
+                now_str = now.strftime("%d/%m/%Y %H:%M")
+                day_name = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"][now.weekday()]
+                import subprocess as _sp
+                result = _sp.run(
+                    ["python3.11", "audit_bot.py", "--silent"],
+                    capture_output=True, text=True, timeout=60, cwd="/app"
+                )
+                output = result.stdout
+                passed = output.count("[PASS]")
+                failed_count = output.count("[FAIL]")
+                warn_count = output.count("[WARN]")
+                total = passed + failed_count + warn_count
+                status_emoji = "✅" if failed_count == 0 else "❌"
+                status_changed = (_last_failed_count != -1 and failed_count != _last_failed_count)
+                change_note = ""
+                if status_changed:
+                    change_note = f"\n{'📈 שיפור' if failed_count < _last_failed_count else '📉 הידרדות'}! כשלים: {_last_failed_count} → {failed_count}"
+                _last_failed_count = failed_count
+                lines = [
+                    f"{status_emoji} *בקרה מעגלית יומית — ארביטראז' — {day_name} {now_str}*\n",
+                    f"📊 עברו: *{passed}/{total}* | ❌ כשלים: *{failed_count}* | ⚠️ אזהרות: *{warn_count}*",
+                ]
+                if change_note:
+                    lines.append(change_note)
+                if failed_count > 0:
+                    fail_lines = [l for l in output.split("\n") if "[FAIL]" in l]
+                    lines.append("\n*🚨 כשלים שדורשים תיקון:*")
+                    for fl in fail_lines:
+                        lines.append(f"  {fl.strip()}")
+                    lines.append("\n⚠️ שלח /a\_audit לפרטים")
+                elif warn_count > 0:
+                    lines.append("⚠️ יש אזהרות הדורשות בדיקה")
+                else:
+                    lines.append("🎉 כל התכונות פועלות כמצופה — המערכת תקינה!")
+                lines.append("\n_/a\_audit לבדיקה ידנית_")
+                await app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text="\n".join(lines),
+                    parse_mode="Markdown"
+                )
+                logger.info(f"בקרה יומית (ארביטראז') נשלחה: {passed}/{total} עברו")
+            except Exception as e:
+                logger.warning(f"שגיאה בבקרה מעגלית (ארביטראז'): {e}")
+                await asyncio.sleep(3600)
+
+    asyncio.ensure_future(_circular_audit_loop())
     await _scan_loop(app.bot)
 
 
